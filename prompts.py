@@ -386,3 +386,138 @@ def build_comparison_prompt(
 
         Respond now. Start your response with the character {{ and end with }}.
     """)
+
+# ---------------------------------------------------------------------------
+# ── LEVEL 3: PRODUCT UX AUDIT (new) ───────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+PRODUCT_UX_SCHEMA: Final[dict[str, Any]] = {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "ProductUXAuditReport",
+    "type": "object",
+    "required": [
+        "overall_score",
+        "consistency_score",
+        "screens_analyzed",
+        "summary",
+        "strengths",
+        "issues",
+        "recommendations",
+        "final_verdict",
+    ],
+    "additionalProperties": False,
+    "properties": {
+        "overall_score":      {"type": "integer", "minimum": 0, "maximum": 100},
+        "consistency_score":  {"type": "integer", "minimum": 0, "maximum": 100},
+        "screens_analyzed":   {"type": "integer", "minimum": 1},
+        "summary":            {"type": "string", "minLength": 30, "maxLength": 600},
+        "strengths": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["area", "description"],
+                "additionalProperties": False,
+                "properties": {
+                    "area":        {"type": "string", "minLength": 3, "maxLength": 80},
+                    "description": {"type": "string", "minLength": 10, "maxLength": 400},
+                },
+            },
+        },
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["area", "description", "severity", "affected_screens"],
+                "additionalProperties": False,
+                "properties": {
+                    "area":        {"type": "string", "minLength": 3, "maxLength": 80},
+                    "description": {"type": "string", "minLength": 10, "maxLength": 400},
+                    "severity":    {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+                    "affected_screens": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                },
+            },
+        },
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["title", "description", "priority"],
+                "additionalProperties": False,
+                "properties": {
+                    "title":       {"type": "string", "minLength": 3, "maxLength": 100},
+                    "description": {"type": "string", "minLength": 10, "maxLength": 400},
+                    "priority":    {"type": "string", "enum": ["high", "medium", "low"]},
+                },
+            },
+        },
+        "final_verdict": {"type": "string", "minLength": 10, "maxLength": 300},
+    },
+}
+
+PRODUCT_UX_SYSTEM_PROMPT: Final[str] = dedent("""
+    You are a senior product UX auditor who specialises in evaluating the
+    design consistency and usability of multi-screen digital products.
+
+    ═══════════════════════════════════════════════════════════════════════
+    MISSION
+    ═══════════════════════════════════════════════════════════════════════
+    You will receive multiple screenshots from a single product. Evaluate them
+    together as a cohesive product experience. Base every finding on directly
+    observable visual evidence only.
+
+    ═══════════════════════════════════════════════════════════════════════
+    STRICT OPERATING RULES
+    ═══════════════════════════════════════════════════════════════════════
+    ✦ Evaluate ALL provided screenshots together, not each in isolation.
+    ✦ Focus on cross-screen inconsistencies and product UX issues.
+    ✦ Only report issues that are observable in the screenshots.
+    ✦ screens_analyzed must equal the number of images provided.
+    ✦ Identify at least 2 strengths and at least 2 issues when they exist.
+
+    ═══════════════════════════════════════════════════════════════════════
+    OUTPUT FORMAT — READ CAREFULLY
+    ═══════════════════════════════════════════════════════════════════════
+    YOUR RESPONSE MUST BE RAW JSON AND NOTHING ELSE.
+
+    FORBIDDEN:
+      ✗ Markdown fences (``` or ```json)
+      ✗ Any text before the opening brace  {
+      ✗ Any text after the closing brace   }
+      ✗ Single-quoted property names
+      ✗ Trailing commas or comments
+
+    REQUIRED:
+      ✓ Start with { as the very first character
+      ✓ End with } as the very last character
+      ✓ Use double quotes around every property name and string value
+      ✓ Be parseable by json.loads() with zero modification
+""")
+
+
+def build_product_ux_prompt(*, filenames: list[str], total_size_kb: float) -> str:
+    """Build the user-turn prompt for a Level 3 product UX audit."""
+    if not filenames:
+        raise ValueError("'filenames' must contain at least one filename.")
+
+    schema_block = json.dumps(PRODUCT_UX_SCHEMA, indent=2)
+    screen_list = "\n".join(
+        f"  Screen {i + 1}: {name}" for i, name in enumerate(filenames)
+    )
+
+    return dedent(f"""
+        Perform a product UX audit across all attached screenshots.
+
+        ── SCREENS PROVIDED ─────────────────────────────────────────────────
+        {screen_list}
+        Total size: {total_size_kb:.1f} KB
+        ─────────────────────────────────────────────────────────────────────
+        Return ONLY a JSON object that matches this schema exactly:
+
+        {schema_block}
+        ─────────────────────────────────────────────────────────────────────
+        Analyse the product UX now and return only the JSON report.
+    """)

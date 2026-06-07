@@ -26,6 +26,9 @@ from prompts import (
     # ── Level 2 additions ──
     COMPARISON_SYSTEM_PROMPT,
     build_comparison_prompt,
+    # ── Level 3 additions ──
+    PRODUCT_UX_SYSTEM_PROMPT,
+    build_product_ux_prompt,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,6 +92,25 @@ class ComparisonResult:
     raw_response:    str
 
 
+# ── Return type for Level 3 (new) ─────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class ProductAuditResult:
+    """Typed wrapper around a completed product UX audit.
+
+    Attributes:
+        report:          Parsed product audit dictionary.
+        filenames:       List of original filenames that were analysed.
+        model_name:      Gemini model that produced the report.
+        latency_seconds: Wall-clock time for the Gemini round-trip.
+        raw_response:    Raw JSON string returned by the model.
+    """
+    report:          dict[str, Any]
+    filenames:       list[str]
+    model_name:      str
+    latency_seconds: float
+    raw_response:    str
+
+
 # ── Custom exceptions (unchanged from Level 1) ─────────────────────────────────
 class AnalyzerError(Exception):
     """Base exception for all GeminiAnalyzer failures."""
@@ -143,6 +165,9 @@ class GeminiAnalyzer:
             # is first called. This avoids creating two SDK clients on startup.
             self._comparison_model = None
 
+            # ── Level 3 model (product UX audit) — created lazily ───────────
+            self._product_model = None
+
         except Exception as exc:
             raise AnalyzerError(
                 f"Failed to initialise Gemini SDK. "
@@ -168,6 +193,19 @@ class GeminiAnalyzer:
             )
             logger.info("Comparison model initialised.")
         return self._comparison_model
+
+    # ── Private helper: get (or create) the Level 3 model ─────────────────────
+    def _get_product_model(self):
+        """Return the Level 3 product-audit model, creating it on first call."""
+        if self._product_model is None:
+            self._product_model = genai.GenerativeModel(
+                model_name=DEFAULT_MODEL_NAME,
+                system_instruction=PRODUCT_UX_SYSTEM_PROMPT,
+                generation_config=_GENERATION_CONFIG,
+                safety_settings=_SAFETY_SETTINGS,
+            )
+            logger.info("Product UX audit model initialised.")
+        return self._product_model
 
     # =========================================================================
     # LEVEL 1 — Single Screenshot Audit (unchanged)
@@ -304,6 +342,84 @@ class GeminiAnalyzer:
             latency_seconds=latency,
             raw_response=raw_response,
         )
+
+    # =========================================================================
+    # LEVEL 3 — Product UX Audit (new method)
+    # =========================================================================
+
+    def analyze_product_flow(
+        self,
+        images: list[Image.Image],
+        filenames: list[str],
+    ) -> ProductAuditResult:
+        """Audit multiple product screenshots together for UX consistency."""
+        if not images:
+            raise ImageValidationError("At least one image is required for a product audit.")
+        if len(images) != len(filenames):
+            raise ImageValidationError(
+                f"images ({len(images)}) and filenames ({len(filenames)}) must be the same length."
+            )
+        for img, fname in zip(images, filenames):
+            self._validate_image(img, fname)
+
+        rgb_images = [self._to_rgb(img) for img in images]
+        total_size_kb = sum(self._compute_size_kb(img) for img in rgb_images)
+
+        user_prompt = build_product_ux_prompt(
+            filenames=filenames,
+            total_size_kb=total_size_kb,
+        )
+
+        contents = rgb_images + [user_prompt]
+        raw_response, latency = self._call_gemini(
+            model=self._get_product_model(),
+            contents=contents,
+            filename=f"{len(images)} screens",
+        )
+
+        report = self._parse_product_response(raw_response, filenames)
+
+        logger.info(
+            "Product audit complete. screens=%d score=%s latency=%.2fs",
+            len(images), report.get("overall_score"), latency,
+        )
+        return ProductAuditResult(
+            report=report,
+            filenames=filenames,
+            model_name=DEFAULT_MODEL_NAME,
+            latency_seconds=latency,
+            raw_response=raw_response,
+        )
+
+    @staticmethod
+    def _parse_product_response(
+        raw_response: str,
+        filenames: list[str],
+    ) -> dict[str, Any]:
+        """Parse the Level 3 product audit JSON response."""
+        json_str = GeminiAnalyzer._extract_json(raw_response)
+
+        try:
+            report: dict[str, Any] = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            snippet = json_str[max(0, exc.pos - 60): exc.pos + 60]
+            logger.error("JSON parse error in product response. pos=%d snippet=%r", exc.pos, snippet)
+            raise ResponseParseError(
+                f"Product audit response for {len(filenames)} screens is not valid JSON. "
+                f"Error at position {exc.pos}: {exc.msg}. Area: {snippet!r}"
+            ) from exc
+
+        required = {
+            "overall_score", "consistency_score", "screens_analyzed",
+            "summary", "strengths", "issues", "recommendations", "final_verdict",
+        }
+        missing = required - report.keys()
+        if missing:
+            raise ResponseParseError(
+                f"Product audit response is missing keys: {sorted(missing)}."
+            )
+
+        return report
 
     # =========================================================================
     # Private helpers (shared by both levels)

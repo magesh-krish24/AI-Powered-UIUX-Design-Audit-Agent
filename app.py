@@ -1,11 +1,12 @@
 """
-app.py - Streamlit UI for the AI-Powered UI/UX Design Audit Agent.
+app.py - AI-Powered UI/UX Design Audit Agent
 
-Level 1: Single screenshot audit (unchanged).
-Level 2: Before/After design comparison (new).
+Level 1: Single screenshot audit      (original, unchanged)
+Level 2: Before/After comparison      (original, unchanged)
+Level 3: Multi-screen product UX audit (new)
 
-A mode selector at the top lets the user switch between the two modes.
-Everything in Level 1 is identical to the original — no existing code was removed.
+UI: plain Streamlit components only — no custom CSS, no HTML injection.
+This matches the last stable version for L1/L2 and extends it for L3.
 """
 
 import streamlit as st
@@ -14,22 +15,30 @@ from PIL import Image
 from analyzer import GeminiAnalyzer
 
 # ── Page config ────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="UI/UX Design Audit Agent", layout="centered")
+st.set_page_config(
+    page_title="UI/UX Design Audit Agent",
+    page_icon="🎨",
+    layout="centered",
+)
+
 st.title("🎨 AI-Powered UI/UX Design Audit Agent")
 
 # ── Mode selector ──────────────────────────────────────────────────────────────
-# This is the only new element added to the top of the page.
-# The user picks between Level 1 (single audit) and Level 2 (comparison).
 mode = st.radio(
     label="Select Mode",
-    options=["🔍 Level 1: Design Audit", "⚖️ Level 2: Design Comparison"],
+    options=[
+        "🔍 Level 1: Design Audit",
+        "⚖️ Level 2: Design Comparison",
+        "🖼️ Level 3: Product UX Audit",
+    ],
     horizontal=True,
 )
 
 st.divider()
 
+
 # =============================================================================
-# LEVEL 1 — Single Screenshot Audit (original code, completely unchanged)
+# LEVEL 1 — Single Screenshot Audit  (original code, completely unchanged)
 # =============================================================================
 if mode == "🔍 Level 1: Design Audit":
 
@@ -39,7 +48,7 @@ if mode == "🔍 Level 1: Design Audit":
     uploaded_file = st.file_uploader(
         label="Upload a screenshot",
         type=["png", "jpg", "jpeg", "webp"],
-        key="level1_upload",   # unique key so Streamlit doesn't mix up the two uploaders
+        key="level1_upload",
     )
 
     # Step 2: Optional context
@@ -98,15 +107,18 @@ if mode == "🔍 Level 1: Design Audit":
             if len(findings) == 0:
                 st.write("No issues found. Great design!")
 
-            severity_icons = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"}
+            severity_icons = {
+                "CRITICAL": "🔴", "HIGH": "🟠",
+                "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪",
+            }
 
             for finding in findings:
-                severity  = finding.get("severity", "unknown").upper()
-                principle = finding.get("principle", "unknown").replace("_", " ").title()
-                issue     = finding.get("issue", "No description.")
-                location  = finding.get("location", "Unknown location")
-                impact    = finding.get("user_impact", "No impact described.")
-                rec       = finding.get("recommendation", "No recommendation.")
+                severity   = finding.get("severity", "unknown").upper()
+                principle  = finding.get("principle", "unknown").replace("_", " ").title()
+                issue      = finding.get("issue", "No description.")
+                location   = finding.get("location", "Unknown location")
+                impact     = finding.get("user_impact", "No impact described.")
+                rec        = finding.get("recommendation", "No recommendation.")
                 confidence = finding.get("confidence_score", 0)
                 icon = severity_icons.get(severity, "❓")
 
@@ -120,9 +132,9 @@ if mode == "🔍 Level 1: Design Audit":
 
 
 # =============================================================================
-# LEVEL 2 — Design Comparison (all new code below)
+# LEVEL 2 — Design Comparison  (original code, completely unchanged)
 # =============================================================================
-else:
+elif mode == "⚖️ Level 2: Design Comparison":
 
     st.write("Upload a **Before** and **After** screenshot to compare the two designs.")
 
@@ -143,8 +155,7 @@ else:
             key="after_upload",
         )
 
-    # Step 2: Show both images side by side as soon as they are uploaded.
-    # Each image appears directly below its own uploader.
+    # Step 2: Show both images side by side as soon as they are uploaded
     if before_file is not None:
         with col_before:
             st.image(Image.open(before_file), caption="Before", use_container_width=True)
@@ -165,8 +176,6 @@ else:
     compare_clicked = st.button("⚖️ Compare Designs", type="primary", key="compare_btn")
 
     if compare_clicked:
-
-        # Make sure both files are uploaded before running.
         if before_file is None or after_file is None:
             st.error("Please upload both a Before and an After screenshot.")
         else:
@@ -197,12 +206,10 @@ else:
             after_score  = report.get("after_score", 0)
             score_change = report.get("score_change", 0)
 
-            # Show the three scores in three columns.
             sc1, sc2, sc3 = st.columns(3)
             sc1.metric(label="Before Score", value=f"{before_score} / 100")
             sc2.metric(label="After Score",  value=f"{after_score} / 100")
 
-            # The delta on the third metric shows the direction of change.
             if score_change > 0:
                 sc3.metric(label="Score Change", value=f"+{score_change}", delta=f"+{score_change} pts")
             elif score_change < 0:
@@ -224,8 +231,6 @@ else:
             st.write(report.get("summary", "No summary available."))
 
             # ── Helper to render a list of comparison items ────────────────────
-            # Each item has: principle, description, and optionally impact/severity.
-            # We reuse this small function for all four lists below.
             def show_items(items, extra_field=None, extra_label=None):
                 """Display a list of comparison finding items."""
                 if not items:
@@ -234,7 +239,7 @@ else:
                 for item in items:
                     principle   = item.get("principle", "unknown").replace("_", " ").title()
                     description = item.get("description", "No description.")
-                    with st.expander(f"**{principle}** — {description[:60]}..."):
+                    with st.expander(f"{principle} — {description[:60]}"):
                         st.write(f"**Description:** {description}")
                         if extra_field and extra_label:
                             st.write(f"**{extra_label}:** {item.get(extra_field, 'N/A')}")
@@ -260,3 +265,116 @@ else:
             show_items(resolved)
 
             st.caption(f"⏱️ Comparison completed in {result.latency_seconds:.2f} seconds.")
+
+
+# =============================================================================
+# LEVEL 3 — Product UX Audit  (new, same style as L1 and L2)
+# =============================================================================
+else:
+
+    st.write(
+        "Upload multiple screenshots from your product and the AI will evaluate "
+        "UX consistency across all screens."
+    )
+
+    # Step 1: Multi-file uploader
+    uploaded_files = st.file_uploader(
+        label="Upload product screenshots (PNG, JPG, WEBP)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="level3_upload",
+    )
+
+    # Step 2: Show uploaded screenshots in a gallery (3 per row)
+    if uploaded_files:
+        st.write(f"**{len(uploaded_files)} screenshot(s) ready to analyze:**")
+        cols_per_row = 3
+        for row_start in range(0, len(uploaded_files), cols_per_row):
+            row_files = uploaded_files[row_start : row_start + cols_per_row]
+            cols = st.columns(len(row_files))
+            for col, f in zip(cols, row_files):
+                with col:
+                    st.image(Image.open(f), caption=f.name, use_container_width=True)
+
+    # Step 3: Analyze button
+    audit_clicked = st.button("🖼️ Analyze Product UX", type="primary", key="level3_btn")
+
+    if audit_clicked:
+        if not uploaded_files:
+            st.error("Please upload at least one screenshot before analyzing.")
+        else:
+            images    = [Image.open(f) for f in uploaded_files]
+            filenames = [f.name for f in uploaded_files]
+
+            with st.spinner(f"Analyzing {len(images)} screen(s) with Gemini Vision..."):
+                try:
+                    analyzer = GeminiAnalyzer()
+                    result = analyzer.analyze_product_flow(
+                        images=images,
+                        filenames=filenames,
+                    )
+                    report = result.report
+                except Exception as error:
+                    st.error(f"Product audit failed: {error}")
+                    st.stop()
+
+            st.success("Product UX audit complete!")
+
+            # ── Scores ────────────────────────────────────────────────────────
+            st.subheader("📊 Scores")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Overall Score",     f"{report.get('overall_score', 0)} / 100")
+            s2.metric("Consistency Score", f"{report.get('consistency_score', 0)} / 100")
+            s3.metric("Screens Analyzed",  report.get("screens_analyzed", len(images)))
+
+            # ── Summary ───────────────────────────────────────────────────────
+            st.subheader("📋 Summary")
+            st.write(report.get("summary", "No summary available."))
+
+            # ── Final verdict ─────────────────────────────────────────────────
+            st.subheader("🏁 Final Verdict")
+            st.info(report.get("final_verdict", "No verdict available."))
+
+            # ── Strengths ─────────────────────────────────────────────────────
+            strengths = report.get("strengths", [])
+            st.subheader(f"✅ Strengths ({len(strengths)})")
+            if not strengths:
+                st.write("_None identified._")
+            for item in strengths:
+                area = item.get("area", "")
+                desc = item.get("description", "")
+                with st.expander(f"✅ {area}"):
+                    st.write(desc)
+
+            # ── Issues ────────────────────────────────────────────────────────
+            issues = report.get("issues", [])
+            st.subheader(f"⚠️ Issues ({len(issues)})")
+            sev_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵"}
+            if not issues:
+                st.write("_None identified._")
+            for item in issues:
+                area    = item.get("area", "")
+                desc    = item.get("description", "")
+                sev     = item.get("severity", "low")
+                screens = item.get("affected_screens", [])
+                icon    = sev_icons.get(sev, "⚪")
+                with st.expander(f"{icon} {sev.upper()} — {area}"):
+                    st.write(f"**Description:** {desc}")
+                    if screens:
+                        st.write(f"**Affected Screens:** {', '.join(screens)}")
+
+            # ── Recommendations ───────────────────────────────────────────────
+            recommendations = report.get("recommendations", [])
+            st.subheader(f"💡 Recommendations ({len(recommendations)})")
+            pri_icons = {"high": "🔴", "medium": "🟡", "low": "🔵"}
+            if not recommendations:
+                st.write("_None provided._")
+            for item in recommendations:
+                title = item.get("title", "")
+                desc  = item.get("description", "")
+                pri   = item.get("priority", "medium")
+                icon  = pri_icons.get(pri, "⚪")
+                with st.expander(f"{icon} {pri.upper()} PRIORITY — {title}"):
+                    st.write(desc)
+
+            st.caption(f"⏱️ Audit completed in {result.latency_seconds:.2f} seconds.")
