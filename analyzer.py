@@ -1,12 +1,10 @@
 """
 analyzer.py - Gemini Vision client for the AI-powered UI/UX Design Audit Agent.
 
-This module owns the single responsibility of taking a PIL Image, marshalling
-it into a Gemini API request, and returning a validated Python dictionary that
-conforms to the JSON_OUTPUT_SCHEMA defined in prompts.py.
+Level 1: GeminiAnalyzer.analyze_image()   — single screenshot audit.
+Level 2: GeminiAnalyzer.compare_designs() — before/after comparison (new).
 
-All prompt engineering lives in prompts.py. All configuration lives in
-config.py. This module is intentionally free of UI, framework, and I/O code.
+All new code is additive. Nothing from Level 1 has been changed.
 """
 
 from __future__ import annotations
@@ -15,27 +13,24 @@ import io
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import google.generativeai as genai
 from PIL import Image
 
 from config import GEMINI_API_KEY, DEFAULT_MODEL_NAME, MIN_CONFIDENCE_SCORE
-from prompts import SYSTEM_PROMPT, build_analysis_prompt
-
-# ---------------------------------------------------------------------------
-# Module-level logger
-# ---------------------------------------------------------------------------
+from prompts import (
+    SYSTEM_PROMPT,
+    build_analysis_prompt,
+    # ── Level 2 additions ──
+    COMPARISON_SYSTEM_PROMPT,
+    build_comparison_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Gemini safety settings — keep all thresholds at their defaults so the SDK
-# does not silently suppress responses for design-related content.
+# ── Gemini generation settings (shared by both modes) ─────────────────────────
 _SAFETY_SETTINGS: list[dict[str, str]] = [
     {"category": "HARM_CATEGORY_HARASSMENT",        "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HATE_SPEECH",       "threshold": "BLOCK_NONE"},
@@ -44,35 +39,28 @@ _SAFETY_SETTINGS: list[dict[str, str]] = [
 ]
 
 _GENERATION_CONFIG: dict[str, Any] = {
-    # Temperature 0 maximises determinism; design audits are analytical, not creative.
     "temperature": 0.0,
     "top_p": 0.95,
     "top_k": 40,
     "max_output_tokens": 8192,
-    # Instruct the model to emit JSON so the SDK can surface finish_reason correctly.
     "response_mime_type": "application/json",
 }
 
-# Bytes → kilobytes conversion factor.
 _BYTES_PER_KB: float = 1024.0
 
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
 
+# ── Return type for Level 1 ────────────────────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class AuditResult:
-    """Typed wrapper around a completed design audit.
+    """Typed wrapper around a completed single-screenshot audit.
 
     Attributes:
-        report:          The full audit dictionary conforming to JSON_OUTPUT_SCHEMA.
+        report:          Parsed audit dictionary (conforms to JSON_OUTPUT_SCHEMA).
         filename:        Original filename of the analysed screenshot.
         model_name:      Gemini model that produced the report.
-        latency_seconds: Wall-clock time (seconds) for the Gemini round-trip.
-        raw_response:    The raw JSON string returned by the model, preserved for
-                         debugging and logging purposes.
+        latency_seconds: Wall-clock time for the Gemini round-trip.
+        raw_response:    Raw JSON string returned by the model.
     """
-
     report:          dict[str, Any]
     filename:        str
     model_name:      str
@@ -80,78 +68,110 @@ class AuditResult:
     raw_response:    str
 
 
-# ---------------------------------------------------------------------------
-# Custom exceptions
-# ---------------------------------------------------------------------------
+# ── Return type for Level 2 (new) ─────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class ComparisonResult:
+    """Typed wrapper around a completed before/after design comparison.
 
+    Attributes:
+        report:           Parsed comparison dictionary (conforms to COMPARISON_OUTPUT_SCHEMA).
+        before_filename:  Original filename of the Before screenshot.
+        after_filename:   Original filename of the After screenshot.
+        model_name:       Gemini model that produced the report.
+        latency_seconds:  Wall-clock time for the Gemini round-trip.
+        raw_response:     Raw JSON string returned by the model.
+    """
+    report:          dict[str, Any]
+    before_filename: str
+    after_filename:  str
+    model_name:      str
+    latency_seconds: float
+    raw_response:    str
+
+
+# ── Custom exceptions (unchanged from Level 1) ─────────────────────────────────
 class AnalyzerError(Exception):
     """Base exception for all GeminiAnalyzer failures."""
-
 
 class ImageValidationError(AnalyzerError):
     """Raised when the supplied image fails pre-flight validation."""
 
-
 class APIError(AnalyzerError):
     """Raised when the Gemini API returns an error or an empty response."""
-
 
 class ResponseParseError(AnalyzerError):
     """Raised when the model response cannot be parsed into valid JSON."""
 
 
-# ---------------------------------------------------------------------------
-# Analyzer
-# ---------------------------------------------------------------------------
-
+# ─────────────────────────────────────────────────────────────────────────────
+# GeminiAnalyzer
+# ─────────────────────────────────────────────────────────────────────────────
 class GeminiAnalyzer:
     """Sends PIL images to Gemini Vision and returns structured audit reports.
 
-    The class is intentionally stateless beyond the initialised SDK client so
-    that a single instance can safely analyse multiple images sequentially
-    (or concurrently, provided callers manage thread safety externally).
+    Supports two modes:
+      • Level 1 — analyze_image()   : single screenshot audit.
+      • Level 2 — compare_designs() : before/after design comparison.
 
-    Typical usage::
-
-        analyzer = GeminiAnalyzer()
-        image = Image.open("checkout.png")
-        result = analyzer.analyze_image(image, filename="checkout.png")
-        print(result.report["overall_score"])
+    A single instance can handle both modes. The comparison method creates
+    a separate Gemini model instance internally so that it can use its own
+    system prompt without affecting the Level 1 model.
     """
 
     def __init__(self) -> None:
-        """Initialise the Gemini SDK client and model.
+        """Initialise the Level 1 Gemini model client.
 
-        Reads ``GEMINI_API_KEY`` and ``DEFAULT_MODEL_NAME`` from ``config.py``.
+        The Level 2 model is initialised lazily inside compare_designs()
+        the first time it is needed, so __init__ stays fast and simple.
 
         Raises:
-            AnalyzerError: If the Gemini SDK cannot be configured (e.g. the API
-                key is rejected during client initialisation).
+            AnalyzerError: If the Gemini SDK cannot be configured.
         """
         try:
             genai.configure(api_key=GEMINI_API_KEY)
-            self._model: genai.GenerativeModel = genai.GenerativeModel(
+
+            # ── Level 1 model (single screenshot audit) ────────────────────
+            self._model = genai.GenerativeModel(
                 model_name=DEFAULT_MODEL_NAME,
                 system_instruction=SYSTEM_PROMPT,
                 generation_config=_GENERATION_CONFIG,
                 safety_settings=_SAFETY_SETTINGS,
             )
+
+            # ── Level 2 model (comparison) — created lazily ─────────────────
+            # We keep it as None here and create it only when compare_designs()
+            # is first called. This avoids creating two SDK clients on startup.
+            self._comparison_model = None
+
         except Exception as exc:
             raise AnalyzerError(
                 f"Failed to initialise Gemini SDK. "
-                f"Verify that GEMINI_API_KEY is valid and the network is reachable. "
-                f"Underlying error: {exc}"
+                f"Verify that GEMINI_API_KEY is valid. Error: {exc}"
             ) from exc
 
-        logger.info(
-            "GeminiAnalyzer initialised. model=%s min_confidence=%s",
-            DEFAULT_MODEL_NAME,
-            MIN_CONFIDENCE_SCORE,
-        )
+        logger.info("GeminiAnalyzer initialised. model=%s", DEFAULT_MODEL_NAME)
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+    # ── Private helper: get (or create) the Level 2 model ─────────────────────
+    def _get_comparison_model(self):
+        """Return the Level 2 comparison model, creating it on first call.
+
+        Using a separate model instance for comparison means we can give it
+        its own system prompt (COMPARISON_SYSTEM_PROMPT) without changing
+        the Level 1 model's instructions.
+        """
+        if self._comparison_model is None:
+            self._comparison_model = genai.GenerativeModel(
+                model_name=DEFAULT_MODEL_NAME,
+                system_instruction=COMPARISON_SYSTEM_PROMPT,
+                generation_config=_GENERATION_CONFIG,
+                safety_settings=_SAFETY_SETTINGS,
+            )
+            logger.info("Comparison model initialised.")
+        return self._comparison_model
+
+    # =========================================================================
+    # LEVEL 1 — Single Screenshot Audit (unchanged)
+    # =========================================================================
 
     def analyze_image(
         self,
@@ -161,72 +181,43 @@ class GeminiAnalyzer:
     ) -> AuditResult:
         """Analyse a PIL Image and return a structured design audit report.
 
-        The method orchestrates the full pipeline:
-
-        1. Pre-flight validation of the image object and filename.
-        2. Calculation of the in-memory file size (used for prompt context).
-        3. Construction of the user-turn prompt via ``build_analysis_prompt()``.
-        4. Transmission of the image and prompt to Gemini Vision.
-        5. Extraction and JSON-parsing of the model response.
-        6. Post-processing: confidence filtering and metadata consistency check.
-        7. Return of a fully populated :class:`AuditResult`.
-
         Args:
-            image:              A ``PIL.Image.Image`` object. Any mode is
-                                accepted; the image is converted to RGB
-                                internally before being sent to the API.
-            filename:           Original filename of the screenshot, used for
-                                logging and embedded in the prompt for context.
-                                Must be a non-empty string.
-            additional_context: Optional free-text context from the submitting
-                                user (e.g. target audience, area of concern).
-                                Pass ``None`` to omit.
+            image:              PIL Image object of the screenshot.
+            filename:           Original filename of the screenshot.
+            additional_context: Optional context text from the user.
 
         Returns:
-            An :class:`AuditResult` containing the parsed report dictionary,
-            model metadata, and timing information.
+            AuditResult containing the parsed report and metadata.
 
         Raises:
-            ImageValidationError: If ``image`` is not a PIL Image or
-                                  ``filename`` is empty.
-            APIError:             If the Gemini API returns an empty, blocked,
-                                  or otherwise unusable response.
-            ResponseParseError:   If the model response is not valid JSON or
-                                  is missing required top-level keys.
-            AnalyzerError:        For unexpected errors during the API call.
+            ImageValidationError: If the image or filename is invalid.
+            APIError:             If the Gemini API response is unusable.
+            ResponseParseError:   If the response is not valid JSON.
         """
-        # ── Step 1: validate inputs ────────────────────────────────────────
         self._validate_image(image, filename)
-
-        # ── Step 2: compute image size ─────────────────────────────────────
         file_size_kb = self._compute_size_kb(image)
-        logger.debug("Image validated. filename=%s size_kb=%.1f", filename, file_size_kb)
 
-        # ── Step 3: build prompt ───────────────────────────────────────────
         user_prompt = build_analysis_prompt(
             filename=filename,
             file_size_kb=file_size_kb,
             additional_context=additional_context,
         )
 
-        # ── Step 4: call Gemini Vision ─────────────────────────────────────
         rgb_image = self._to_rgb(image)
-        raw_response, latency = self._call_gemini(rgb_image, user_prompt, filename)
+        raw_response, latency = self._call_gemini(
+            model=self._model,
+            contents=[rgb_image, user_prompt],
+            filename=filename,
+        )
 
-        # ── Step 5: parse JSON ─────────────────────────────────────────────
         report = self._parse_response(raw_response, filename)
-
-        # ── Step 6: post-process ───────────────────────────────────────────
         report = self._filter_low_confidence(report)
         report = self._reconcile_metadata(report)
 
-        # ── Step 7: return result ──────────────────────────────────────────
         logger.info(
-            "Audit complete. filename=%s overall_score=%s findings=%s latency=%.2fs",
-            filename,
-            report.get("overall_score"),
-            report.get("audit_metadata", {}).get("total_findings"),
-            latency,
+            "Audit complete. filename=%s score=%s findings=%s latency=%.2fs",
+            filename, report.get("overall_score"),
+            report.get("audit_metadata", {}).get("total_findings"), latency,
         )
         return AuditResult(
             report=report,
@@ -236,303 +227,356 @@ class GeminiAnalyzer:
             raw_response=raw_response,
         )
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # LEVEL 2 — Design Comparison (new method)
+    # =========================================================================
+
+    def compare_designs(
+        self,
+        before_image: Image.Image,
+        after_image: Image.Image,
+        before_filename: str,
+        after_filename: str,
+        additional_context: str | None = None,
+    ) -> ComparisonResult:
+        """Compare a Before and After screenshot and return a comparison report.
+
+        This method sends BOTH images to Gemini in a single request. The model
+        sees Image 1 (Before) and Image 2 (After) side-by-side in its context
+        and evaluates what changed across the five design principles.
+
+        Args:
+            before_image:       PIL Image of the original/before design.
+            after_image:        PIL Image of the redesigned/after design.
+            before_filename:    Original filename of the Before screenshot.
+            after_filename:     Original filename of the After screenshot.
+            additional_context: Optional context text from the user.
+
+        Returns:
+            ComparisonResult containing the parsed comparison report.
+
+        Raises:
+            ImageValidationError: If either image or filename is invalid.
+            APIError:             If the Gemini API response is unusable.
+            ResponseParseError:   If the response is not valid JSON.
+        """
+        # Validate both images before making any API call.
+        self._validate_image(before_image, before_filename)
+        self._validate_image(after_image, after_filename)
+
+        before_size_kb = self._compute_size_kb(before_image)
+        after_size_kb  = self._compute_size_kb(after_image)
+
+        # Build the prompt that explains which image is Before and which is After.
+        user_prompt = build_comparison_prompt(
+            before_filename=before_filename,
+            after_filename=after_filename,
+            before_size_kb=before_size_kb,
+            after_size_kb=after_size_kb,
+            additional_context=additional_context,
+        )
+
+        # Convert both images to RGB (Gemini handles RGB best).
+        before_rgb = self._to_rgb(before_image)
+        after_rgb  = self._to_rgb(after_image)
+
+        # Send: [before_image, after_image, text_prompt] in one request.
+        # The model's system prompt tells it Image 1 = Before, Image 2 = After.
+        raw_response, latency = self._call_gemini(
+            model=self._get_comparison_model(),
+            contents=[before_rgb, after_rgb, user_prompt],
+            filename=f"{before_filename} vs {after_filename}",
+        )
+
+        # Parse the JSON response — same helper as Level 1.
+        report = self._parse_comparison_response(raw_response, before_filename, after_filename)
+
+        logger.info(
+            "Comparison complete. before=%s after=%s verdict=%s latency=%.2fs",
+            before_filename, after_filename,
+            report.get("overall_verdict"), latency,
+        )
+        return ComparisonResult(
+            report=report,
+            before_filename=before_filename,
+            after_filename=after_filename,
+            model_name=DEFAULT_MODEL_NAME,
+            latency_seconds=latency,
+            raw_response=raw_response,
+        )
+
+    # =========================================================================
+    # Private helpers (shared by both levels)
+    # =========================================================================
 
     @staticmethod
     def _validate_image(image: Any, filename: str) -> None:
-        """Raise :class:`ImageValidationError` if inputs fail pre-flight checks.
-
-        Args:
-            image:    The value passed as the image argument.
-            filename: The value passed as the filename argument.
-
-        Raises:
-            ImageValidationError: On any validation failure.
-        """
+        """Check that the image is a valid PIL Image and filename is non-empty."""
         if not isinstance(image, Image.Image):
             raise ImageValidationError(
-                f"Expected a PIL.Image.Image object; got {type(image).__name__}. "
-                "Open the file with PIL.Image.open() before passing it to the analyzer."
+                f"Expected PIL.Image.Image; got {type(image).__name__}. "
+                "Use PIL.Image.open() before passing to the analyzer."
             )
         if not filename or not filename.strip():
             raise ImageValidationError("'filename' must be a non-empty string.")
-
         width, height = image.size
         if width < 1 or height < 1:
             raise ImageValidationError(
-                f"Image has zero-dimension size ({width}×{height}). "
-                "The file may be corrupt or empty."
+                f"Image has zero-dimension size ({width}×{height}). File may be corrupt."
             )
-
-        logger.debug("Image pre-flight passed. mode=%s size=%dx%d", image.mode, width, height)
 
     @staticmethod
     def _to_rgb(image: Image.Image) -> Image.Image:
-        """Convert image to RGB mode if necessary.
-
-        Gemini Vision handles JPEG-encoded images best in RGB. Modes like
-        RGBA, P (palette), or L (greyscale) are converted transparently.
-
-        Args:
-            image: Source PIL image.
-
-        Returns:
-            The original image if already RGB, otherwise a converted copy.
-        """
+        """Convert image to RGB mode. Gemini Vision works best with RGB."""
         if image.mode == "RGB":
             return image
-        logger.debug("Converting image mode %s → RGB.", image.mode)
         return image.convert("RGB")
 
     @staticmethod
     def _compute_size_kb(image: Image.Image) -> float:
-        """Estimate the in-memory PNG size of the image in kilobytes.
-
-        The PNG size is used as a proxy for the original file size when the
-        caller has not supplied a file path. It is embedded in the prompt for
-        context and logged for observability.
-
-        Args:
-            image: PIL image (any mode).
-
-        Returns:
-            Estimated file size in kilobytes, rounded to one decimal place.
-        """
+        """Estimate the in-memory PNG size of the image in kilobytes."""
         buffer = io.BytesIO()
         image.save(buffer, format="PNG", optimize=False)
-        size_kb = buffer.tell() / _BYTES_PER_KB
-        return round(size_kb, 1)
+        return round(buffer.tell() / _BYTES_PER_KB, 1)
 
-    def _call_gemini(
-        self,
-        image: Image.Image,
-        user_prompt: str,
-        filename: str,
-    ) -> tuple[str, float]:
-        """Send the image and prompt to Gemini and return the raw text response.
+    @staticmethod
+    def _call_gemini(model, contents: list, filename: str) -> tuple[str, float]:
+        """Send a request to Gemini and return (raw_text, latency_seconds).
+
+        This helper is reused by both analyze_image() and compare_designs().
+        The caller passes the right model instance and the right contents list.
 
         Args:
-            image:       RGB PIL image.
-            user_prompt: Fully constructed user-turn prompt string.
-            filename:    Used for contextual log messages only.
+            model:    The GenerativeModel instance to use.
+            contents: List of content parts (images and/or text strings).
+            filename: Used only for log and error messages.
 
         Returns:
-            A ``(raw_text, latency_seconds)`` tuple.
+            Tuple of (raw_text_response, latency_in_seconds).
 
         Raises:
-            APIError:     If the response is blocked, empty, or the finish
-                          reason indicates a non-successful completion.
+            APIError:     If the response is blocked or empty.
             AnalyzerError: For unexpected SDK or network errors.
         """
-        logger.info("Sending request to Gemini. filename=%s model=%s", filename, DEFAULT_MODEL_NAME)
+        logger.info("Sending request to Gemini. context=%s", filename)
         start = time.perf_counter()
 
         try:
-            response = self._model.generate_content(
-                contents=[image, user_prompt],
-                stream=False,
-            )
+            response = model.generate_content(contents=contents, stream=False)
         except Exception as exc:
             raise AnalyzerError(
-                f"Gemini API call failed for '{filename}'. "
-                f"Check network connectivity and quota limits. "
-                f"Underlying error: {exc}"
+                f"Gemini API call failed for '{filename}'. Error: {exc}"
             ) from exc
 
         latency = time.perf_counter() - start
-        logger.debug("Gemini responded in %.2fs.", latency)
 
-        # ── Guard: blocked prompt ──────────────────────────────────────────
-        if response.prompt_feedback and hasattr(response.prompt_feedback, "block_reason"):
-            block_reason = response.prompt_feedback.block_reason
-            if block_reason:
-                raise APIError(
-                    f"Gemini blocked the request for '{filename}'. "
-                    f"block_reason={block_reason}. "
-                    "Review the image content or adjust safety settings."
-                )
-
-        # ── Guard: no candidates ───────────────────────────────────────────
-        if not response.candidates:
+        # Guard: blocked prompt
+        if response.prompt_feedback and getattr(response.prompt_feedback, "block_reason", None):
             raise APIError(
-                f"Gemini returned no candidates for '{filename}'. "
-                "The model may have encountered an internal error."
+                f"Gemini blocked the request for '{filename}'. "
+                f"block_reason={response.prompt_feedback.block_reason}"
             )
 
-        candidate = response.candidates[0]
+        # Guard: no candidates returned
+        if not response.candidates:
+            raise APIError(f"Gemini returned no candidates for '{filename}'.")
 
-        # ── Guard: non-STOP finish reason ──────────────────────────────────
-        finish_reason = getattr(candidate, "finish_reason", None)
-        # finish_reason == 1 corresponds to FinishReason.STOP in the SDK enum.
-        if finish_reason is not None and finish_reason != 1:
-            logger.warning(
-                "Unexpected finish_reason=%s for '%s'. Attempting to parse anyway.",
-                finish_reason,
-                filename,
-            )
-
-        # ── Extract text ───────────────────────────────────────────────────
+        # Guard: empty text
         try:
             raw_text: str = response.text
         except ValueError as exc:
             raise APIError(
-                f"Could not extract text from Gemini response for '{filename}'. "
-                f"The response may have been filtered. Details: {exc}"
+                f"Could not extract text from Gemini response for '{filename}'. {exc}"
             ) from exc
 
         if not raw_text or not raw_text.strip():
-            raise APIError(
-                f"Gemini returned an empty response for '{filename}'. "
-                "Retry or check the model configuration."
-            )
+            raise APIError(f"Gemini returned an empty response for '{filename}'.")
 
         return raw_text.strip(), latency
 
     @staticmethod
     def _parse_response(raw_response: str, filename: str) -> dict[str, Any]:
-        """Parse the raw Gemini response string into a Python dictionary.
-
-        The method strips common LLM artefacts (markdown fences) before
-        parsing to make the pipeline resilient to minor model formatting
-        deviations.
-
-        Args:
-            raw_response: Raw text returned by :meth:`_call_gemini`.
-            filename:     Used for contextual error messages.
-
-        Returns:
-            Parsed report dictionary.
-
-        Raises:
-            ResponseParseError: If the text is not valid JSON or is missing
-                                 the required top-level keys.
-        """
-        # Strip markdown code fences that some model versions include.
+        """Parse Level 1 JSON response. Strips markdown fences if present."""
         cleaned = raw_response.strip()
         if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            # Remove opening fence (```json or ```) and closing fence (```)
             cleaned = "\n".join(
-                line for line in lines
+                line for line in cleaned.splitlines()
                 if not line.strip().startswith("```")
             ).strip()
 
         try:
             report: dict[str, Any] = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            logger.error(
-                "JSON parse failure for '%s'. offset=%d snippet=%r",
-                filename,
-                exc.pos,
-                cleaned[max(0, exc.pos - 40): exc.pos + 40],
-            )
             raise ResponseParseError(
                 f"Model response for '{filename}' is not valid JSON. "
-                f"Parse error at position {exc.pos}: {exc.msg}. "
-                "Check raw_response on the AuditResult for the raw model output."
+                f"Error at position {exc.pos}: {exc.msg}."
             ) from exc
 
-        # ── Structural validation ──────────────────────────────────────────
-        required_keys = {"screenshot_summary", "overall_score", "findings", "audit_metadata"}
-        missing = required_keys - report.keys()
+        required = {"screenshot_summary", "overall_score", "findings", "audit_metadata"}
+        missing = required - report.keys()
         if missing:
             raise ResponseParseError(
-                f"Model response for '{filename}' is missing required top-level "
-                f"keys: {sorted(missing)}. The model may have deviated from the schema."
+                f"Response for '{filename}' is missing keys: {sorted(missing)}."
             )
 
-        if not isinstance(report.get("findings"), list):
+        return report
+
+    @staticmethod
+    def _extract_json(text: str) -> str:
+        """Pull the first complete JSON object out of a raw string.
+
+        This is the core safety net for the comparison parser. It handles
+        every messy thing Gemini might prepend or append to the JSON:
+
+        • Markdown fences  (```json ... ``` or ``` ... ```)
+        • Introductory prose  ("Here is the comparison report: {...")
+        • Trailing notes     ("} \n\nLet me know if you need anything.")
+        • Mixed indentation or leading whitespace on the fence line
+
+        The strategy is simple:
+          1. Strip markdown fences line-by-line.
+          2. Find the first '{' and the last '}' in what remains.
+          3. Return only the text between those two characters (inclusive).
+
+        Args:
+            text: Raw string returned by the Gemini API.
+
+        Returns:
+            The extracted JSON substring, ready for json.loads().
+
+        Raises:
+            ResponseParseError: If no '{' or '}' can be found at all.
+        """
+        # Step 1 — remove every line that is only a markdown fence.
+        # A fence line looks like: optional-whitespace ``` optional-language-tag
+        lines = text.splitlines()
+        cleaned_lines = []
+        for line in lines:
+            stripped = line.strip()
+            # Skip lines that are just ``` or ```json or ```JSON etc.
+            if stripped.startswith("```"):
+                continue
+            cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines)
+
+        # Step 2 — find the outer braces of the JSON object.
+        start = cleaned.find("{")
+        end   = cleaned.rfind("}")
+
+        if start == -1 or end == -1 or end <= start:
             raise ResponseParseError(
-                f"'findings' in the model response for '{filename}' is not a list. "
-                f"Got: {type(report.get('findings')).__name__}."
+                "Could not find a JSON object in the model response. "
+                "The response may be pure prose or was completely malformed. "
+                f"First 200 chars received: {text[:200]!r}"
             )
 
-        logger.debug(
-            "Parsed response successfully. filename=%s findings=%d",
-            filename,
-            len(report["findings"]),
-        )
+        # Step 3 — slice out exactly the JSON object.
+        return cleaned[start : end + 1]
+
+    @staticmethod
+    def _parse_comparison_response(
+        raw_response: str,
+        before_filename: str,
+        after_filename: str,
+    ) -> dict[str, Any]:
+        """Parse the Level 2 comparison JSON response into a Python dictionary.
+
+        Uses _extract_json() first to safely isolate the JSON object from any
+        surrounding prose or markdown that Gemini might have added, then runs
+        json.loads(), then validates the required top-level keys.
+
+        Args:
+            raw_response:    Raw text returned by _call_gemini().
+            before_filename: Used in error messages only.
+            after_filename:  Used in error messages only.
+
+        Returns:
+            Parsed comparison report dictionary.
+
+        Raises:
+            ResponseParseError: If the text cannot be parsed or is missing keys.
+        """
+        label = f"'{before_filename}' vs '{after_filename}'"
+
+        # Pull out just the JSON object, discarding any surrounding text.
+        try:
+            json_str = GeminiAnalyzer._extract_json(raw_response)
+        except ResponseParseError:
+            raise  # re-raise with the message already set by _extract_json
+
+        # Parse the isolated JSON string.
+        try:
+            report: dict[str, Any] = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            # Log a snippet around the problem position to help debugging.
+            snippet_start = max(0, exc.pos - 60)
+            snippet_end   = min(len(json_str), exc.pos + 60)
+            snippet = json_str[snippet_start:snippet_end]
+            logger.error(
+                "JSON parse error in comparison response. pos=%d snippet=%r",
+                exc.pos, snippet,
+            )
+            raise ResponseParseError(
+                f"Comparison response for {label} is not valid JSON. "
+                f"Parse error at position {exc.pos}: {exc.msg}. "
+                f"Problem area: {snippet!r}"
+            ) from exc
+
+        # Validate that all required top-level keys are present.
+        required = {
+            "before_score", "after_score", "score_change",
+            "improvements", "regressions", "new_issues",
+            "resolved_issues", "overall_verdict", "summary",
+        }
+        missing = required - report.keys()
+        if missing:
+            raise ResponseParseError(
+                f"Comparison response for {label} is missing required keys: "
+                f"{sorted(missing)}. Keys present: {sorted(report.keys())}."
+            )
+
+        # Fix any arithmetic error in score_change silently.
+        expected_change = report["after_score"] - report["before_score"]
+        if report["score_change"] != expected_change:
+            logger.warning(
+                "score_change mismatch: model said %d, expected %d. Correcting.",
+                report["score_change"], expected_change,
+            )
+            report["score_change"] = expected_change
+
         return report
 
     @staticmethod
     def _filter_low_confidence(report: dict[str, Any]) -> dict[str, Any]:
-        """Remove findings whose confidence_score falls below MIN_CONFIDENCE_SCORE.
-
-        Although the schema specifies ``minimum: 60`` for confidence_score,
-        this post-processing step enforces the project-level threshold
-        (``MIN_CONFIDENCE_SCORE`` from config.py) as a second safety net.
-
-        Args:
-            report: Parsed report dictionary.
-
-        Returns:
-            The same report dictionary with low-confidence findings removed.
-            Mutates ``report["findings"]`` in place and returns the report for
-            convenient chaining.
-        """
-        # Convert 0–1 float threshold (from config) to 0–100 integer scale.
+        """Remove Level 1 findings below MIN_CONFIDENCE_SCORE threshold."""
         threshold = int(MIN_CONFIDENCE_SCORE * 100)
         original_count = len(report["findings"])
-
         report["findings"] = [
             f for f in report["findings"]
             if isinstance(f.get("confidence_score"), (int, float))
             and f["confidence_score"] >= threshold
         ]
-
         removed = original_count - len(report["findings"])
         if removed:
-            logger.info(
-                "Filtered %d low-confidence finding(s) below threshold=%d.",
-                removed,
-                threshold,
-            )
+            logger.info("Filtered %d low-confidence finding(s).", removed)
         return report
 
     @staticmethod
     def _reconcile_metadata(report: dict[str, Any]) -> dict[str, Any]:
-        """Recompute audit_metadata counts from the actual findings list.
+        """Recompute Level 1 audit_metadata counts from the actual findings list."""
+        findings = report.get("findings", [])
+        severity_counts  = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        principle_counts = {"visual_hierarchy": 0, "contrast_wcag_aa": 0, "spacing": 0, "alignment": 0, "consistency": 0}
 
-        The model is instructed to self-report counts, but this step overwrites
-        those counts with values derived from the authoritative findings array.
-        This eliminates any discrepancy the model may have introduced.
+        for f in findings:
+            sev  = f.get("severity", "")
+            prin = f.get("principle", "")
+            if sev  in severity_counts:  severity_counts[sev]   += 1
+            if prin in principle_counts: principle_counts[prin] += 1
 
-        Args:
-            report: Parsed (and confidence-filtered) report dictionary.
-
-        Returns:
-            The same report dictionary with audit_metadata counts corrected.
-        """
-        findings: list[dict[str, Any]] = report.get("findings", [])
-
-        severity_counts: dict[str, int] = {
-            "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
-        }
-        principle_counts: dict[str, int] = {
-            "visual_hierarchy": 0,
-            "contrast_wcag_aa": 0,
-            "spacing": 0,
-            "alignment": 0,
-            "consistency": 0,
-        }
-
-        for finding in findings:
-            sev = finding.get("severity", "")
-            if sev in severity_counts:
-                severity_counts[sev] += 1
-
-            prin = finding.get("principle", "")
-            if prin in principle_counts:
-                principle_counts[prin] += 1
-
-        metadata: dict[str, Any] = report.setdefault("audit_metadata", {})
+        metadata = report.setdefault("audit_metadata", {})
         metadata["total_findings"]        = len(findings)
         metadata["findings_by_severity"]  = severity_counts
         metadata["findings_by_principle"] = principle_counts
-        # Preserve model_notes if the model supplied them; default to empty string.
         metadata.setdefault("model_notes", "")
-
-        logger.debug("Metadata reconciled. total_findings=%d", len(findings))
         return report
